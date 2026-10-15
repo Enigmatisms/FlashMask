@@ -1,0 +1,8 @@
+# Export only the bridge C ABI; localize all implementation internals.
+# ctypes only needs the fm4_overlap_* prefix.
+{
+    global:
+        fm4_overlap_*;
+    local:
+        *;
+};

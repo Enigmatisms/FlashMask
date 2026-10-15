@@ -1,0 +1,2 @@
+# Built by setup.py (FLASHMASK_BUILD=cpb/all) via the standalone CMake in csrc/.
+libflashmask_cpbalance*.so

@@ -1,0 +1,15 @@
+[build-system]
+# Declared so that pip drives the build through PEP 517 instead of the legacy
+# `setup.py develop` path. That path is what broke editable installs: modern
+# setuptools deprecates `develop` and reimplements it by re-invoking
+#   python -m pip install -e . --use-pep517 --no-deps
+# which does NOT inherit the outer --no-build-isolation, so the inner pip tried
+# to download setuptools from the index and failed on indexes that do not carry
+# it. Going through PEP 517 directly keeps --no-build-isolation in effect.
+#
+# Note: with --no-build-isolation (which this project needs, because setup.py
+# installs its own deps at build time via _ensure_deps) pip does NOT install the
+# requirements listed here -- the ambient setuptools must already satisfy them.
+# setuptools>=64 is the floor for PEP 660 editable installs (`build_editable`).
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
