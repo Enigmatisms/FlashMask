@@ -16,6 +16,7 @@ class PaddleBackend(BackendBase):
     float16 = paddle.float16
     bfloat16 = paddle.bfloat16
     float32 = paddle.float32
+    float8_e4m3fn = paddle.float8_e4m3fn
     int32 = paddle.int32
     int64 = paddle.int64
     bool_ = paddle.bool
@@ -26,6 +27,7 @@ class PaddleBackend(BackendBase):
         paddle.float16: cutlass.Float16,
         paddle.bfloat16: cutlass.BFloat16,
         paddle.float32: cutlass.Float32,
+        paddle.float8_e4m3fn: cutlass.Float8E4M3FN,  # MXFP8 forward payload
     }
 
     # -- device / stream -----------------------------------------------------

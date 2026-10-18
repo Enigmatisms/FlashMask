@@ -73,11 +73,15 @@ def _flash_attn_fwd(
     block_size: int = 64,
     block_bos: Optional[Tensor] = None,
     group=None,
+    mx_scales: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Forward pass for FlashAttention.
 
     Args:
         ...
+        mx_scales: MXFP8 forward (SM100, d = dv = 128 or 256). q/k/v are then E4M3 payloads and
+            mx_scales = (sf_q, sf_k, sf_v) their packed E8M0 scales, both produced by
+            flashmask.cute.mxfp8.quantize_qkv. The output is BF16.
         block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
@@ -312,7 +316,15 @@ def _flash_attn_fwd(
         )
         assert list(v.shape) == [batch_size, seqlen_k, num_head_kv, head_dim_v]
 
-    assert q.dtype in [be.float16, be.bfloat16], "inputs must be float16 or bfloat16"
+    blockscaled = mx_scales is not None
+    if blockscaled:
+        assert compute_capability == 10 and q.dtype == k.dtype == v.dtype == be.float8_e4m3fn
+        assert head_dim == head_dim_v and head_dim in (128, 256), "MXFP8 forward: d = dv = 128 or 256"
+        assert seqlen_q % 128 == 0 and seqlen_k % 128 == 0, "MXFP8 forward needs seqlen % 128 == 0"
+        assert learnable_sink is None and block_logit is None and num_splits == 1
+        pack_gqa = False
+    else:
+        assert q.dtype in [be.float16, be.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     if learnable_sink is not None:
         assert list(learnable_sink.shape) == [
@@ -351,7 +363,7 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    out_framework_dtype = q.dtype
+    out_framework_dtype = be.bfloat16 if blockscaled else q.dtype
     q_batch_seqlen_shape = [batch_size, seqlen_q]
     lse_shape = [batch_size, num_head, seqlen_q]
     requires_grad = any(be.requires_grad(t) for t in (q, k, v))
@@ -634,6 +646,15 @@ def _flash_attn_fwd(
         overlap_kv_chunk_size = None
         overlap_bhsd_layout = None
 
+    # MXFP8: the packed uint8 scale buffers (see flashmask.cute.mxfp8.pack_scales).
+    mx_kwargs = (
+        {
+            name: from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=0)
+            for name, t in zip(("mSFQ", "mSFK", "mSFV"), mx_scales)
+        }
+        if blockscaled
+        else {}
+    )
     compile_key = (
         dtype,
         head_dim,
@@ -659,6 +680,7 @@ def _flash_attn_fwd(
         block_logit is None,
         block_size,
         block_bos is None,
+        blockscaled,
     ) + (
         # SRBuffer K/V require a distinct artifact only when overlap is active.
         (overlap_bhsd_layout, overlap_kv_chunk_size) if enable_overlap else ()
@@ -702,6 +724,7 @@ def _flash_attn_fwd(
                 block_size=block_size,
                 has_block_bos=block_bos is not None,
                 use_2cta_instrs=use_2cta_instrs,
+                blockscaled=blockscaled,
             )
         else:
             raise ValueError(
@@ -743,6 +766,7 @@ def _flash_attn_fwd(
                 if enable_overlap
                 else {}
             ),
+            **mx_kwargs,
             stream=current_stream,
         )
     # Runtime address and shape scalars are re-supplied below; compile-time
@@ -781,6 +805,7 @@ def _flash_attn_fwd(
             if enable_overlap
             else {}
         ),
+        **mx_kwargs,
         stream=current_stream,
     )
     if is_split_kv:
