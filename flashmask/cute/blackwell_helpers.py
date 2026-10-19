@@ -51,15 +51,6 @@ def tmem_cols(n: int, m_total: int, cta_group: int) -> int:
     return n // 2
 
 
-import os as _os  # TEMP CF
-_CF_MMA_DIV = int(_os.environ.get("FM4_CF_MMA_DIV", "1"))  # TEMP CF
-assert _CF_MMA_DIV in (1, 2, 4, 8)  # TEMP CF
-
-
-def _cf_keep(k: int) -> bool:  # TEMP CF
-    return k % _CF_MMA_DIV == 0
-
-
 # ---- MXFP8 block-scaled MMA helpers (ported from Meta LP-FA4 blackwell_helpers.py) ----
 def make_s2t_copy_partitions(
     smem_tensor: cute.Tensor,
@@ -96,8 +87,7 @@ def gemm_blockscaled(
             tiled_mma.set(tcgen05.Field.ACCUMULATE, not zero_init)
         else:
             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-        if const_expr(_CF_MMA_DIV == 1) or _cf_keep(k):  # TEMP CF
-            cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
+        cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
 @cute.jit
@@ -123,9 +113,8 @@ def gemm_w_idx(
         for k in cutlass.range(
             cute.size(tCrA.shape[2]), unroll=cute.size(tCrA.shape[2]) // num_unroll_groups
         ):
-            if const_expr(_CF_MMA_DIV == 1) or _cf_keep(k):  # TEMP CF
-                mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
-                cute.gemm(mma_atom, acc, rA[None, None, k], rB[None, None, k], acc)
+            mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
+            cute.gemm(mma_atom, acc, rA[None, None, k], rB[None, None, k], acc)
 
 
 @cute.jit
@@ -572,8 +561,7 @@ def gemm_ptx_partial(
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    + (f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
-                       if _cf_keep(k) else "")  # TEMP CF
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(1, cute.size(tCrA.shape[2]))
             )
@@ -645,8 +633,7 @@ def gemm_ptx_partial(
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
                     # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
-                    + (f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
-                       if _cf_keep(k) else "")  # TEMP CF
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(
                     1,
@@ -661,8 +648,7 @@ def gemm_ptx_partial(
                     (
                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                        + (f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
-                           if _cf_keep(k) else "")  # TEMP CF
+                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                     )
                     for k in range(cute.size(tCrA.shape[2]) // 4 * 3, cute.size(tCrA.shape[2]))
                 )

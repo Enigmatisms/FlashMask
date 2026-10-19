@@ -74,6 +74,7 @@ def _flash_attn_fwd(
     block_bos: Optional[Tensor] = None,
     group=None,
     mx_scales: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
+    fp8_descales: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Forward pass for FlashAttention.
 
@@ -82,6 +83,10 @@ def _flash_attn_fwd(
         mx_scales: MXFP8 forward (SM100, d = dv = 128 or 256). q/k/v are then E4M3 payloads and
             mx_scales = (sf_q, sf_k, sf_v) their packed E8M0 scales, both produced by
             flashmask.cute.mxfp8.quantize_qkv. The output is BF16.
+        fp8_descales: row-wise FP8 forward (SM100, head_dim > 256 with 256 < head_dim_v <= 512,
+            the folded 2-CTA config). q/k/v are E4M3 payloads and fp8_descales =
+            (descale_q [b, h, s_q], descale_k [b, h_k, s_k], descale_v [b, h_k, dv]) their FP32
+            descales, both produced by flashmask.cute.mxfp8.quantize_qkv_rowwise. The output is BF16.
         block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
@@ -206,8 +211,9 @@ def _flash_attn_fwd(
         # n=64 doubles the 1-CTA KV tile at identical per-CTA SMEM (the pair splits the MMA's
         # N, so sK/sV per CTA is halved). The folded config additionally requires
         # n_block_size * sizeof(dtype) == 128B, i.e. one P row is exactly one swizzle period
-        # of the A-operand SMEM layout (asserted in softmax_loop).
-        n_block_size = 64
+        # of the A-operand SMEM layout (asserted in softmax_loop): n=128 for FP8, at the same
+        # K/V bytes per tile as BF16 n=64.
+        n_block_size = 128 if fp8_descales is not None else 64
     fwd_cta_group_size = 2 if use_2cta_instrs else 1
 
     # Each SM100 CTA processes q_stage * m_block_size query rows; single_q_stage
@@ -317,12 +323,22 @@ def _flash_attn_fwd(
         assert list(v.shape) == [batch_size, seqlen_k, num_head_kv, head_dim_v]
 
     blockscaled = mx_scales is not None
-    if blockscaled:
+    rowwise_fp8 = fp8_descales is not None
+    assert not (blockscaled and rowwise_fp8)
+    if blockscaled or rowwise_fp8:
         assert compute_capability == 10 and q.dtype == k.dtype == v.dtype == be.float8_e4m3fn
-        assert head_dim == head_dim_v and head_dim in (128, 256), "MXFP8 forward: d = dv = 128 or 256"
-        assert seqlen_q % 128 == 0 and seqlen_k % 128 == 0, "MXFP8 forward needs seqlen % 128 == 0"
+        assert seqlen_q % 128 == 0 and seqlen_k % 128 == 0, "FP8 forward needs seqlen % 128 == 0"
         assert learnable_sink is None and block_logit is None and num_splits == 1
+        assert not enable_overlap and block_sparse_tensors is None
         pack_gqa = False
+    if blockscaled:
+        assert head_dim == head_dim_v and head_dim in (128, 256), "MXFP8 forward: d = dv = 128 or 256"
+    elif rowwise_fp8:
+        assert head_dim > 256 and 256 < head_dim_v <= 512, "row-wise FP8 forward: the folded d > 256 config"
+        dq, dk, dv_ = fp8_descales
+        assert list(dq.shape) == [batch_size, num_head, seqlen_q] and dq.dtype == be.float32
+        assert list(dk.shape) == [batch_size, num_head_kv, seqlen_k] and dk.dtype == be.float32
+        assert list(dv_.shape) == [batch_size, num_head_kv, head_dim_v] and dv_.dtype == be.float32
     else:
         assert q.dtype in [be.float16, be.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
@@ -363,7 +379,7 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    out_framework_dtype = be.bfloat16 if blockscaled else q.dtype
+    out_framework_dtype = be.bfloat16 if blockscaled or rowwise_fp8 else q.dtype
     q_batch_seqlen_shape = [batch_size, seqlen_q]
     lse_shape = [batch_size, num_head, seqlen_q]
     requires_grad = any(be.requires_grad(t) for t in (q, k, v))
@@ -646,13 +662,18 @@ def _flash_attn_fwd(
         overlap_kv_chunk_size = None
         overlap_bhsd_layout = None
 
-    # MXFP8: the packed uint8 scale buffers (see flashmask.cute.mxfp8.pack_scales).
+    # FP8: the packed uint8 MXFP8 scale buffers or the FP32 row-wise descales (flashmask.cute.mxfp8).
     mx_kwargs = (
         {
             name: from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=0)
             for name, t in zip(("mSFQ", "mSFK", "mSFV"), mx_scales)
         }
         if blockscaled
+        else {
+            name: from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
+            for name, t in zip(("mDescaleQ", "mDescaleK", "mDescaleV"), fp8_descales)
+        }
+        if rowwise_fp8
         else {}
     )
     compile_key = (
@@ -681,6 +702,7 @@ def _flash_attn_fwd(
         block_size,
         block_bos is None,
         blockscaled,
+        rowwise_fp8,
     ) + (
         # SRBuffer K/V require a distinct artifact only when overlap is active.
         (overlap_bhsd_layout, overlap_kv_chunk_size) if enable_overlap else ()
@@ -725,6 +747,7 @@ def _flash_attn_fwd(
                 has_block_bos=block_bos is not None,
                 use_2cta_instrs=use_2cta_instrs,
                 blockscaled=blockscaled,
+                rowwise_fp8=rowwise_fp8,
             )
         else:
             raise ValueError(

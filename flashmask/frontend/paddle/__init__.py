@@ -43,10 +43,21 @@ def flashmask_attention(
     block_mask: paddle.Tensor | None = None,
     learnable_sink: paddle.Tensor | None = None,
     group=None,
+    fp8: bool = False,
 ):
+    """FlashMask attention on the CuTe DSL kernels.
+
+    fp8: FP8 forward on SM100 (BF16 query/key/value; head_dim = head_dim_v in {128, 256} runs
+    MXFP8, head_dim > 256 with 256 < head_dim_v <= 512 runs row-wise FP8; seqlen % 128 == 0, no
+    learnable_sink / group). Q/K/V are quantized in the forward and the BF16 backward runs on
+    their dequantized values. Off (default): the BF16 kernels, unchanged.
+    """
     _check_cutedsl_supported(query, key, value, get_backend(query, key, value))
     assert dropout == 0.0, (
         "flashmask v4 does not support dropout"
+    )
+    assert not fp8 or query.dtype == key.dtype == value.dtype == paddle.bfloat16, (
+        "flashmask v4 fp8=True needs bfloat16 query/key/value"
     )
     # TODO: support sliding-window mask generation when a window_size is given
     assert window_size is None, (
@@ -121,6 +132,7 @@ def flashmask_attention(
         learnable_sink=learnable_sink,
         startend_row_indices=startend_row_indices,
         group=group,
+        fp8=fp8,
     )
     if return_softmax_lse:
         return [out, lse]

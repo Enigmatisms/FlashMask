@@ -103,6 +103,8 @@ def p_quant(p):
 class Recipe:
     qk: bool = False        # fwd S and bwd S recompute: Q, K in MXFP8 (same copy in both)
     pv: bool = False        # fwd PV and bwd dV: P with scale 256, V / dO in MXFP8
+    pv_v: bool = True       # with pv: also MXFP8-quantize V (off: V is used as given, e.g. the
+                            # dequantized row-wise FP8 V of the d > 256 kernel)
     dp: bool = False        # bwd dP = dO V^T in MXFP8 (else BF16 inputs)
     ds: bool = False        # bwd dQ = dS K, dK = dS^T Q in MXFP8
     do_fmt: str = "e4m3"    # payload format of dO
@@ -163,7 +165,7 @@ def fake_attention(q, k, v, do, bias, r):
         p_fwd = (p_hat * alpha).reshape(s.shape)
     else:
         p_fwd = paddle.exp(s - m)
-    o = paddle.matmul(p_fwd, mx(v, -2, r.pv)) / l
+    o = paddle.matmul(p_fwd, mx(v, -2, r.pv and r.pv_v)) / l
     lse = m + paddle.log(l)
     o_saved = o.astype("bfloat16").astype("float32")             # O is stored in BF16
 

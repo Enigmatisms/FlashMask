@@ -16,6 +16,7 @@ from typing import Tuple
 import paddle
 
 from flashmask.cute.flashmask_utils import FlashMaskInfoPaddle
+from flashmask.cute.mxfp8 import quantize_fp8
 from flashmask.cute.ops.bwd import _flash_attn_bwd
 from flashmask.cute.ops.fwd import _flash_attn_fwd
 
@@ -35,11 +36,15 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
         startend_row_indices: paddle.Tensor | None = None,
         block_mask: paddle.Tensor | None = None,
         group=None,
+        fp8: bool = False,
     ) -> paddle.Tensor | Tuple[paddle.Tensor, paddle.Tensor]:
+        fwd_qkv, saved_qkv, fp8_scales = (query, key, value), (query, key, value), {}
+        if fp8:
+            # FP8 forward. The backward differentiates the quantized function (straight-through
+            # estimator): it runs on the dequantized Q/K/V, so its recomputed S matches the LSE.
+            fwd_qkv, fp8_scales, saved_qkv = quantize_fp8(query, key, value)
         out, lse = _flash_attn_fwd(
-            query,
-            key,
-            value,
+            *fwd_qkv,
             causal=causal,
             softmax_scale=softmax_scale,
             learnable_sink=learnable_sink,
@@ -47,8 +52,9 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             startend_row_indices=startend_row_indices,
             pack_gqa=False,
             group=group,
+            **fp8_scales,
         )
-        ctx.save_for_backward(query, key, value, startend_row_indices, out, lse, learnable_sink)
+        ctx.save_for_backward(*saved_qkv, startend_row_indices, out, lse, learnable_sink)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.group = group

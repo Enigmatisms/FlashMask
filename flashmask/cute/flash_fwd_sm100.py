@@ -2,8 +2,6 @@
 # Copyright (c) 2026 The FlashMask Authors. All rights reserved.
 
 import enum
-import os
-_CF=os.environ.get('MX_CF','')
 import math
 from typing import Type, Tuple, Callable, Optional, Literal
 from functools import partial
@@ -116,6 +114,7 @@ class FlashAttentionForwardSm100:
         has_block_bos: cutlass.Constexpr = False,
         use_2cta_instrs: bool = False,
         blockscaled: bool = False,
+        rowwise_fp8: bool = False,
     ):
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -297,7 +296,7 @@ class FlashAttentionForwardSm100:
         # of P, while the MMA still runs 3 of its 4 K tiles -> the PV gemm consumes the
         # PREVIOUS KV tile's P. (Invisible with an all-ones input, where every tile's P is
         # identical; with random inputs it showed up as a ~50x output error.)
-        self.split_p_store = self.n_block_size // 32 >= 4 and 'nosplit' not in _CF
+        self.split_p_store = self.n_block_size // 32 >= 4
         if self.split_p_store:
             # Guard the invariant above: both split points must cover the same columns.
             store_chunks = self.n_block_size // 32
@@ -323,6 +322,16 @@ class FlashAttentionForwardSm100:
             assert not pack_gqa and not is_split_kv and not has_block_logit
             # The 3/4 + 1/4 split of the P store is laid out for 16-bit P; FP8 P is one piece.
             self.split_p_store = False
+
+        # Row-wise FP8 forward (d > 256, the folded 2-CTA config, where block-scaled MMAs are
+        # not usable with 64 rows per CTA): plain kind::f8f6f4 on E4M3 Q/K/V, with FP32
+        # descales applied outside the tensor core: Q per row (folded into the softmax row
+        # scale), K per key (multiplied into S before the row max), V per dv column (epilogue).
+        # P is E4M3(2^8 * p) as in MXFP8.
+        self.rowwise_fp8 = rowwise_fp8
+        if rowwise_fp8:
+            assert self.folded_acc and not blockscaled, "row-wise FP8: folded (dv > 256) config only"
+        self.p_fp8 = blockscaled or rowwise_fp8
 
         if self.num_s_stages == 1:
             # single_q_stage / 2-CTA big-d: there is a single S/P stage, so the second softmax
@@ -491,7 +500,9 @@ class FlashAttentionForwardSm100:
             # is no separate sV field, see `sV = recast_ptr(sK.iterator, ...)`), so with
             # kv_stage=1 a block's K and V map to the same physical slot and V would
             # overwrite K.
-            self.kv_stage = 2
+            # Row-wise FP8 (d=512 folded): K/V tiles are half the BF16 bytes, so a third stage
+            # fits; measured +8% on full/causal over 2 stages, no change with 4.
+            self.kv_stage = 3 if self.rowwise_fp8 else 2
         elif self.q_dtype.width == 8 or self.q_stage == 1:
             self.kv_stage = 4
         else:
@@ -782,6 +793,11 @@ class FlashAttentionForwardSm100:
         mSFQ: Optional[cute.Tensor] = None,
         mSFK: Optional[cute.Tensor] = None,
         mSFV: Optional[cute.Tensor] = None,
+        # Row-wise FP8 only: FP32 descales. DescaleQ (b, h, s_q), DescaleK (b, h_k, s_k),
+        # DescaleV (b, h_k, dv); flashmask/cute/mxfp8.py quantize_qkv_rowwise makes them.
+        mDescaleQ: Optional[cute.Tensor] = None,
+        mDescaleK: Optional[cute.Tensor] = None,
+        mDescaleV: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -954,9 +970,11 @@ class FlashAttentionForwardSm100:
             # sQ under cta_group=2.
             p_source = tcgen05.OperandSource.SMEM
         p_major_mode = tcgen05.OperandMajorMode.K
+        if const_expr(self.p_fp8 and self.q_dtype is not cutlass.Float8E4M3FN):
+            raise TypeError("FP8 forward requires E4M3 Q/K/V")
+        if const_expr(self.rowwise_fp8):
+            assert mDescaleQ is not None and mDescaleK is not None and mDescaleV is not None
         if const_expr(self.blockscaled):
-            if const_expr(self.q_dtype is not cutlass.Float8E4M3FN):
-                raise TypeError("MXFP8 forward requires E4M3 Q/K/V")
             assert mSFQ is not None and mSFK is not None and mSFV is not None
             tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
                 self.q_dtype, self.q_major_mode, self.k_major_mode,
@@ -1447,6 +1465,9 @@ class FlashAttentionForwardSm100:
             sSFK_layout,
             sSFP_layout,
             sSFV_layout,
+            mDescaleQ,
+            mDescaleK,
+            mDescaleV,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1499,6 +1520,9 @@ class FlashAttentionForwardSm100:
         sSFK_layout: Optional[cute.Layout] = None,
         sSFP_layout: Optional[cute.Layout] = None,
         sSFV_layout: Optional[cute.Layout] = None,
+        mDescaleQ: Optional[cute.Tensor] = None,
+        mDescaleK: Optional[cute.Tensor] = None,
+        mDescaleV: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1967,6 +1991,8 @@ class FlashAttentionForwardSm100:
                 mBlockLogit=mBlockLogit,
                 mBlockBos=mBlockBos,
                 sP=sP,
+                mDescaleQ=mDescaleQ,
+                mDescaleK=mDescaleK,
             )
 
             if const_expr(self.num_s_stages == 1):
@@ -2031,6 +2057,7 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
                 flashmask_info,
                 mQ.shape[2], # (s_q, d, h, b)
+                mDescaleV,
             )
             self.tmem_dealloc_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
@@ -3077,7 +3104,7 @@ class FlashAttentionForwardSm100:
             work_tile = tile_scheduler.get_current_work()
 
         # End of persistent scheduler loop
-        if const_expr(self.blockscaled and self.q_stage == 2 and 'nobar' not in _CF):
+        if const_expr(self.blockscaled and self.q_stage == 2):
             # softmax1 arrives MmaP1 once up front plus once per step, but only QK0 waits on it;
             # consume the last arrival so the named barrier ends the kernel balanced.
             cute.arch.barrier(barrier_id=int(NamedBarrierFwd.MmaP1), number_of_threads=self.mma_p_threads)
@@ -3121,11 +3148,10 @@ class FlashAttentionForwardSm100:
     ):
         """MXFP8 gemm: copy this GEMM's scales into their TMEM columns, then issue it."""
         tCtSFA, tCtSFB, copy_a, sSFA_src, tCtSFA_dst, copy_b, sSFB_src, tCtSFB_dst = sf
-        if const_expr(wait_barrier_id is not None and 'nobar' not in _CF):
+        if const_expr(wait_barrier_id is not None):
             cute.arch.barrier(barrier_id=wait_barrier_id, number_of_threads=self.mma_p_threads)
-        if const_expr('nocp' not in _CF):
-            cute.copy(copy_a, sSFA_src[None, None, None, None, a_slot], tCtSFA_dst)
-            cute.copy(copy_b, sSFB_src[None, None, None, None, b_slot], tCtSFB_dst)
+        cute.copy(copy_a, sSFA_src[None, None, None, None, a_slot], tCtSFA_dst)
+        cute.copy(copy_b, sSFB_src[None, None, None, None, b_slot], tCtSFB_dst)
         sm100_utils.gemm_blockscaled(tiled_mma, acc, tCrA, tCrB, tCtSFA, tCtSFB, zero_init=zero_init)
 
     # for both softmax0 and softmax1 warp group
@@ -3153,6 +3179,8 @@ class FlashAttentionForwardSm100:
         mBlockLogit: Optional[cute.Tensor] = None,
         mBlockBos: Optional[cute.Tensor] = None,
         sP: Optional[cute.Tensor] = None,
+        mDescaleQ: Optional[cute.Tensor] = None,
+        mDescaleK: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -3259,7 +3287,7 @@ class FlashAttentionForwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
 
-        if const_expr(self.blockscaled and self.q_stage == 2 and 'nobar' not in _CF):
+        if const_expr(self.blockscaled and self.q_stage == 2):
             # MXFP8: S1's tail is free before anything ran, so the very first QK0 may take it.
             if stage == 1:
                 cute.arch.barrier_arrive(
@@ -3284,6 +3312,14 @@ class FlashAttentionForwardSm100:
             # `stage` is the Q tile index within this CTA's q_stage tiles (single_q_stage has a
             # single tile, so stage is always 0 there).
             m_block_for_mask = self.m_tile_pair_base(m_block, stage)
+            # Row-wise FP8: this row's Q descale scales the whole softmax row (and the row max
+            # that goes to the LSE); the K descales are per key, see softmax_step.
+            q_descale = Float32(1.0)
+            descale_k_row = None
+            if const_expr(self.rowwise_fp8):
+                q_row = self.m_tile_index(m_block, stage, self.cta_coord_v()) * self.m_block_size + acc_row
+                q_descale = mDescaleQ[batch_idx, head_idx, q_row]
+                descale_k_row = mDescaleK[batch_idx, head_idx // self.qhead_per_kvhead, None]
             if const_expr(self.enable_flashmask):
                 shared_mask_kwargs = dict(
                     m_block=m_block_for_mask,
@@ -3336,12 +3372,13 @@ class FlashAttentionForwardSm100:
                 mask_fn_none = None
 
             softmax = SoftmaxSm100.create(
-                softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16 or 'thr8' in _CF) else (math.log2(448.0 / 256.0) if const_expr(self.blockscaled) else 0.0),
+                softmax_scale_log2 * q_descale if const_expr(self.rowwise_fp8) else softmax_scale_log2,
+                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else (math.log2(448.0 / 256.0) if const_expr(self.p_fp8) else 0.0),
                 softmax_scale=softmax_scale,
-                # MXFP8: P is written as E4M3(2^8 * p) (P-Cast / LP-FA4); the 2^-8 lives in the
-                # constant P scale factor, and correction_loop divides the row sum by 2^8.
-                max_offset=8 if const_expr(self.blockscaled) else 0,
+                # FP8: P is written as E4M3(2^8 * p) (P-Cast / LP-FA4); correction_loop divides
+                # the row sum by 2^8 (MXFP8 also takes 2^-8 as P's scale factor, row-wise FP8
+                # folds it into the V descale).
+                max_offset=8 if const_expr(self.p_fp8) else 0,
             )
             softmax.reset()
 
@@ -3372,6 +3409,7 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 mBlockLogit=mBlockLogit,
                 mBlockBos=mBlockBos,
+                descale_k_row=descale_k_row,
             )
 
             if has_work:
@@ -3550,7 +3588,7 @@ class FlashAttentionForwardSm100:
                         if const_expr(mLSE is not None or learnable_sink is not None):
                             sScale[
                                 acc_row + stage * self.m_block_size + self.m_block_size * 2
-                            ] = softmax.row_max[0]
+                            ] = softmax.row_max[0] * q_descale if const_expr(self.rowwise_fp8) else softmax.row_max[0]
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_generate_block_empty_offset + generate_block_consumer_state.index)
@@ -3589,7 +3627,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
                             acc_row + stage * self.m_block_size + self.m_block_size * 2
-                        ] = softmax.row_max[0]
+                        ] = softmax.row_max[0] * q_descale if const_expr(self.rowwise_fp8) else softmax.row_max[0]
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
             else:
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
@@ -3652,7 +3690,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
                             acc_row + stage * self.m_block_size + self.m_block_size * 2
-                        ] = softmax.row_max[0]
+                        ] = softmax.row_max[0] * q_descale if const_expr(self.rowwise_fp8) else softmax.row_max[0]
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
             # Advance to next tile
@@ -3690,6 +3728,7 @@ class FlashAttentionForwardSm100:
         is_first: bool = False,
         mBlockLogit: Optional[cute.Tensor] = None,
         mBlockBos: Optional[cute.Tensor] = None,
+        descale_k_row: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32, Optional[cutlass.pipeline.PipelineState]]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -3720,13 +3759,27 @@ class FlashAttentionForwardSm100:
             tScScale = None
             tScP = None
 
+        if const_expr(self.rowwise_fp8):
+            # The folded thread holding half `h` of a row has the contiguous keys
+            # [h * n/2, (h + 1) * n/2) of this KV tile, in S fragment order (see mask_r2p's note
+            # in softmax_loop). Load their descales (vectorized) before the S wait.
+            half_n = self.n_block_size // 2
+            _, acc_half = self.acc_row_half(thr_tmem_load.partition_D(tScS), thr_tmem_load.thr_idx)
+            tDKrDK = cute.make_fragment(half_n, Float32)
+            cute.autovec_copy(cute.local_tile(descale_k_row, (half_n,), (n_block * 2 + acc_half,)), tDKrDK)
+
         # Wait for Si
 
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
 
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
-        if const_expr(self.blockscaled and self.q_stage == 2 and 'nobar' not in _CF):
+        if const_expr(self.rowwise_fp8):
+            for i in cutlass.range_constexpr(0, cute.size(tSrS_t2r), 2):
+                tSrS_t2r[i], tSrS_t2r[i + 1] = utils.mul_packed_f32x2(
+                    (tSrS_t2r[i], tSrS_t2r[i + 1]), (tDKrDK[i], tDKrDK[i + 1])
+                )
+        if const_expr(self.blockscaled and self.q_stage == 2):
             # S(stage) is in registers now: tell the MMA warp it may reuse the tail of S(stage)
             # for the next QK(1 - stage) scale factors.
             cute.arch.fence_view_async_tmem_load()
@@ -3983,6 +4036,7 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         flashmask_info: Optional[FlashMaskInfo] = None,
         num_heads: Optional[Int32] = None,
+        mDescaleV: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
 
@@ -4148,9 +4202,10 @@ class FlashAttentionForwardSm100:
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
                     row_sum = sScale[corr_row + stage * self.m_block_size]
-                    if const_expr(self.blockscaled):
-                        # The softmax summed 2^8 * p (max_offset = 8); O itself is already
-                        # unscaled by the constant 2^-8 P scale factor in the PV gemm.
+                    if const_expr(self.p_fp8):
+                        # The softmax summed 2^8 * p (max_offset = 8). MXFP8's O is already
+                        # unscaled by the constant 2^-8 P scale factor in the PV gemm; row-wise
+                        # FP8's O gets the 2^-8 with the V descale in correction_epilogue.
                         row_sum *= Float32(2.0 ** -8)
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         row_max = sScale[corr_row + stage * self.m_block_size + self.m_block_size * 2]
@@ -4191,6 +4246,7 @@ class FlashAttentionForwardSm100:
                         gO,
                         gmem_tiled_copy_O,
                         corr_cta_coord_v,
+                        mDescaleV[batch_idx, head_idx // self.qhead_per_kvhead, None] if const_expr(self.rowwise_fp8) else None,
                     )
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_full_offset + stage)
                     # Signal for the next work tile that O buffers in tmem are already read, so
@@ -4369,6 +4425,7 @@ class FlashAttentionForwardSm100:
         gO: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
         mma_tile_coord_v: Int32 = 0,
+        descale_v_row: Optional[cute.Tensor] = None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -4472,6 +4529,17 @@ class FlashAttentionForwardSm100:
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_s2r = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
         tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
+        if const_expr(self.rowwise_fp8):
+            # Row-wise FP8: O[:, c] *= descale_v[c] * 2^-8 (P was stored as 2^8 * p). The
+            # descale row is broadcast over the rows and partitioned exactly like the identity.
+            gDV = cute.make_tensor(
+                descale_v_row.iterator, cute.make_layout(self.mma_tiler_pv[:2], stride=(0, 1))
+            )
+            tOgDV = thr_mma_c.partition_C(gDV)
+            if const_expr(self.folded_acc):
+                tOgDV = self.folded_o_phys_view(tOgDV)
+            tOgDV_t2r = thr_tmem_load.partition_D(cute.logical_divide(tOgDV, chunk_layout)[(None, None), None])
+            scale = scale * Float32(2.0 ** -8)
         for i in cutlass.range_constexpr(
             self.tmem_cols(self.head_dim_v_padded) // corr_tile_size
         ):
@@ -4479,10 +4547,15 @@ class FlashAttentionForwardSm100:
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
             tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+            if const_expr(self.rowwise_fp8):
+                tOrDV = cute.make_fragment(tOrO_frg.shape, Float32)
+                cute.autovec_copy(tOgDV_t2r[None, 0, 0, i], tOrDV)
             for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
+                factor = (scale, scale)
+                if const_expr(self.rowwise_fp8):
+                    factor = utils.mul_packed_f32x2((tOrDV[j], tOrDV[j + 1]), (scale, scale))
                 tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
-                    (tOrO_frg[j], tOrO_frg[j + 1]),
-                    (scale, scale),
+                    (tOrO_frg[j], tOrO_frg[j + 1]), factor
                 )
             tOrO_frg_cvt = cute.make_fragment(tOrO_frg.shape, self.o_dtype)
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
